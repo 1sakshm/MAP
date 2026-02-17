@@ -1,0 +1,397 @@
+<script lang="ts">
+	import { fade } from "svelte/transition";
+	import Header from "./Header.svelte";
+	import { Board } from "./board";
+	import Keyboard from "./keyboard";
+	import Modal from "./Modal.svelte";
+	import { getContext, onMount, onDestroy, setContext } from "svelte";
+	import Settings from "./settings";
+	import {
+		Share,
+		Separator,
+		Definition,
+		Tutorial,
+		Statistics,
+		Distribution,
+		Timer,
+		Toaster,
+		ShareGame,
+		Tips,
+		Historical,
+	} from "./widgets";
+	import {
+		contractNum,
+		DELAY_INCREMENT,
+		PRAISE,
+		modeData,
+		ROWS,
+		COLS,
+		newSeed,
+		GameState,
+		seededRandomInt,
+		LetterStates,
+		words,
+		Stats,
+	} from "../utils";
+	import { letterStates, settings, mode } from "../stores";
+
+	export let cols: number = COLS;
+	export let rows: number = ROWS;
+	export let word: string;
+	export let stats: Stats;
+	export let game: GameState;
+	export let toaster: Toaster;
+	export let wordList: { words: string[]; valid: string[]; contains: (word: string) => boolean } = words;
+	export let statsKey: string = "stats";
+
+	// Blitz mode props
+	export let blitzMode: boolean = false;
+	export let blitzSeconds: number = 15;
+
+	setContext("toaster", toaster);
+	const version = getContext<string>("version");
+
+	// implement transition delay on keys
+	const delay = DELAY_INCREMENT * rows + 800;
+
+	// Blitz timer state
+	let blitzTimeLeft: number = blitzSeconds * 1000;
+	let blitzInterval: ReturnType<typeof setInterval> | null = null;
+
+	function startBlitzTimer() {
+		stopBlitzTimer();
+		blitzTimeLeft = blitzSeconds * 1000;
+		blitzInterval = setInterval(() => {
+			blitzTimeLeft -= 100;
+			if (blitzTimeLeft <= 0) {
+				blitzTimeLeft = 0;
+				skipGuess();
+			}
+		}, 100);
+	}
+
+	function stopBlitzTimer() {
+		if (blitzInterval !== null) {
+			clearInterval(blitzInterval);
+			blitzInterval = null;
+		}
+	}
+
+	function resetBlitzTimer() {
+		if (blitzMode && game.active) {
+			startBlitzTimer();
+		}
+	}
+
+	function skipGuess() {
+		stopBlitzTimer();
+		game.board.words[game.guesses] = "";
+		++game.guesses;
+		toaster.pop("Time's up!");
+		board.shake(game.guesses - 1);
+		if (game.guesses === rows) {
+			lose();
+		} else {
+			resetBlitzTimer();
+		}
+	}
+
+	$: blitzPercent = blitzTimeLeft / (blitzSeconds * 1000);
+	$: blitzSecondsDisplay = Math.ceil(blitzTimeLeft / 1000);
+	$: blitzBarColor = blitzPercent > 0.66 ? "var(--color-correct)" : blitzPercent > 0.33 ? "var(--color-present)" : "var(--red)";
+
+	let showTutorial = $settings.tutorial === 3;
+	let showSettings = false;
+	let showStats = false;
+	let showHistorical = false;
+	let showRefresh = false;
+
+	let board: Board;
+	let timer: Timer;
+
+	function submitWord() {
+		if (game.latestWord.length !== cols) {
+			toaster.pop("Not enough letters");
+			board.shake(game.guesses);
+		} else if (wordList.contains(game.latestWord)) {
+			if (game.guesses > 0) {
+				const hm = game.checkHardMode();
+				if ($settings.hard[$mode]) {
+					if (hm.type === "🟩") {
+						toaster.pop(
+							`${contractNum(hm.pos + 1)} letter must be ${hm.char.toUpperCase()}`
+						);
+						board.shake(game.guesses);
+						return;
+					} else if (hm.type === "🟨") {
+						toaster.pop(`Guess must contain ${hm.char.toUpperCase()}`);
+						board.shake(game.guesses);
+						return;
+					}
+				} else if (hm.type !== "⬛") {
+					game.validHard = false;
+				}
+			}
+			game.board.state[game.guesses] = game.guess(word);
+			++game.guesses;
+			$letterStates.update(game.lastState, game.lastWord);
+			$letterStates = $letterStates;
+			if (game.lastWord === word) win();
+			else if (game.guesses === rows) lose();
+			else resetBlitzTimer();
+		} else {
+			toaster.pop("Not in word list");
+			board.shake(game.guesses);
+		}
+	}
+
+	function win() {
+		stopBlitzTimer();
+		board.bounce(game.guesses - 1);
+		game.active = false;
+		setTimeout(
+			() => toaster.pop(PRAISE[game.guesses - 1]),
+			DELAY_INCREMENT * cols + DELAY_INCREMENT
+		);
+		setTimeout(setShowStatsTrue, delay * 1.4);
+		if (!modeData.modes[$mode].historical) {
+			stats.addWin(game.guesses, modeData.modes[$mode]);
+			stats = stats;
+			localStorage.setItem(`${statsKey}-${$mode}`, stats.toString());
+		}
+	}
+
+	function lose() {
+		stopBlitzTimer();
+		game.active = false;
+		setTimeout(setShowStatsTrue, delay);
+		if (!modeData.modes[$mode].historical) {
+			stats.addLoss(modeData.modes[$mode]);
+			stats = stats;
+			localStorage.setItem(`${statsKey}-${$mode}`, stats.toString());
+		}
+	}
+
+	function concede() {
+		showSettings = false;
+		setTimeout(setShowStatsTrue, DELAY_INCREMENT);
+		lose();
+	}
+
+	function reload() {
+		modeData.modes[$mode].historical = false;
+		modeData.modes[$mode].seed = newSeed($mode);
+		game = new GameState($mode, localStorage.getItem(`state-${$mode}`), cols, rows);
+		word = wordList.words[seededRandomInt(0, wordList.words.length, modeData.modes[$mode].seed)];
+		$letterStates = new LetterStates();
+		showStats = false;
+		showRefresh = false;
+		timer.reset($mode);
+		resetBlitzTimer();
+	}
+
+	function setShowStatsTrue() {
+		if (!game.active) showStats = true;
+	}
+
+	function onSwipe(e: Swipe) {
+		switch (e.detail.direction) {
+			case "left":
+				$mode = ($mode + 1) % modeData.modes.length;
+				toaster.pop(modeData.modes[$mode].name);
+				break;
+			case "right":
+				$mode = ($mode - 1 + modeData.modes.length) % modeData.modes.length;
+				toaster.pop(modeData.modes[$mode].name);
+				break;
+		}
+	}
+
+	onMount(() => {
+		if (!game.active) setTimeout(setShowStatsTrue, delay);
+		if (blitzMode && game.active) startBlitzTimer();
+	});
+
+	onDestroy(() => {
+		stopBlitzTimer();
+	});
+	// $: toaster.pop(word);
+</script>
+
+<svelte:body on:click={board.hideCtx} on:contextmenu={board.hideCtx} />
+
+<main class:guesses={game.guesses !== 0} style="--rows: {rows}; --cols: {cols}">
+	<Header
+		bind:showRefresh
+		tutorial={$settings.tutorial === 2}
+		on:closeTutPopUp|once={() => ($settings.tutorial = 1)}
+		showStats={stats.played > 0 || (modeData.modes[$mode].historical && !game.active)}
+		on:stats={() => (showStats = true)}
+		on:tutorial={() => (showTutorial = true)}
+		on:settings={() => (showSettings = true)}
+		on:reload={reload}
+	/>
+	{#if blitzMode && game.active}
+		<div class="blitz-timer-container">
+			<div class="blitz-timer-bar" style="width: {blitzPercent * 100}%; background: {blitzBarColor}" class:blitz-urgent={blitzSecondsDisplay <= 5}></div>
+			<span class="blitz-timer-text" class:blitz-urgent-text={blitzSecondsDisplay <= 5}>{blitzSecondsDisplay}s</span>
+		</div>
+	{/if}
+	<Board
+		{cols}
+		{wordList}
+		bind:this={board}
+		bind:value={game.board.words}
+		tutorial={$settings.tutorial === 1}
+		on:closeTutPopUp|once={() => ($settings.tutorial = 0)}
+		board={game.board}
+		guesses={game.guesses}
+		icon={modeData.modes[$mode].icon}
+		on:swipe={onSwipe}
+	/>
+	<Keyboard
+		{cols}
+		on:keystroke={() => {
+			if ($settings.tutorial) $settings.tutorial = 0;
+			board.hideCtx();
+		}}
+		bind:value={game.board.words[game.guesses === rows ? 0 : game.guesses]}
+		on:submitWord={submitWord}
+		on:esc={() => {
+			showTutorial = false;
+			showStats = false;
+			showSettings = false;
+		}}
+		disabled={!game.active || $settings.tutorial === 3 || showHistorical}
+	/>
+</main>
+
+<Modal
+	bind:visible={showTutorial}
+	on:close|once={() => $settings.tutorial === 3 && --$settings.tutorial}
+	fullscreen={$settings.tutorial === 0}
+>
+	<Tutorial visible={showTutorial} />
+</Modal>
+
+<Modal bind:visible={showStats}>
+	{#if modeData.modes[$mode].historical}
+		<h2 class="historical">Statistics not available for historical games</h2>
+	{:else}
+		<Statistics data={stats} />
+		<Distribution distribution={stats.guesses} {game} />
+	{/if}
+	<Separator visible={!game.active}>
+		<Timer
+			slot="1"
+			bind:this={timer}
+			on:timeup={() => (showRefresh = true)}
+			on:reload={reload}
+		/>
+		<Share slot="2" state={game} />
+	</Separator>
+	<ShareGame wordNumber={game.wordNumber} />
+	{#if !game.active}
+		<Definition {word} alternates={2} />
+	{:else}
+		<!-- Fade with delay is to prevent a bright red button from appearing as soon as refresh is pressed -->
+		<div
+			in:fade={{ delay: 300 }}
+			class="button concede"
+			on:click={concede}
+			on:keydown={concede}
+		>
+			give up
+		</div>
+	{/if}
+</Modal>
+
+<Modal fullscreen={true} bind:visible={showSettings}>
+	<Settings state={game} on:historical={() => (showHistorical = true)} />
+	{#if game.active}
+		<div class="button concede" on:click={concede} on:keydown={concede}>give up</div>
+	{/if}
+	<Tips change={showSettings} />
+
+	<svelte:fragment slot="footer">
+		<a href="https://www.nytimes.com/games/wordle/" target="_blank" rel="noreferrer"
+			>Original Wordle</a
+		>
+		<div>
+			<div>v{version}</div>
+			<div
+				title="double click to reset your stats"
+				class="word"
+				on:dblclick={() => {
+					localStorage.clear();
+					toaster.pop("localStorage cleared");
+				}}
+			>
+				{modeData.modes[$mode].name} word #{game.wordNumber}
+			</div>
+		</div>
+	</svelte:fragment>
+</Modal>
+
+<Modal bind:visible={showHistorical}>
+	<Historical bind:showSettings />
+</Modal>
+
+<style lang="scss">
+	main {
+		display: flex;
+		flex-direction: column;
+		justify-content: space-between;
+		align-items: center;
+		height: 100%;
+		max-width: var(--game-width);
+		margin: auto;
+		position: relative;
+	}
+	.historical {
+		text-align: center;
+		margin-top: 10px;
+		padding: 0 20px;
+		text-transform: uppercase;
+	}
+	.concede {
+		background-color: var(--red);
+	}
+	.blitz-timer-container {
+		width: 100%;
+		padding: 0 10px;
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		height: 24px;
+		flex-shrink: 0;
+	}
+	.blitz-timer-bar {
+		height: 6px;
+		border-radius: 3px;
+		flex: 1;
+		transition: width 0.1s linear;
+	}
+	.blitz-urgent {
+		animation: pulse 0.5s ease-in-out infinite alternate;
+	}
+	.blitz-timer-text {
+		font-size: var(--fs-small);
+		font-weight: bold;
+		color: var(--fg-primary);
+		min-width: 28px;
+		text-align: right;
+	}
+	.blitz-urgent-text {
+		color: var(--red);
+		animation: pulse-text 0.5s ease-in-out infinite alternate;
+	}
+	@keyframes pulse {
+		from { opacity: 1; }
+		to { opacity: 0.5; }
+	}
+	@keyframes pulse-text {
+		from { opacity: 1; transform: scale(1); }
+		to { opacity: 0.7; transform: scale(1.15); }
+	}
+</style>
